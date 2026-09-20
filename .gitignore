@@ -1,0 +1,9 @@
+node_modules/
+.expo/
+dist/
+web-build/
+.secrets/
+.dev.vars
+*.log
+.DS_Store
+.wrangler/

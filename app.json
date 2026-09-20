@@ -1,0 +1,46 @@
+{
+  "expo": {
+    "name": "Goose Paint",
+    "slug": "goose-paint",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "scheme": "goosepaint",
+    "newArchEnabled": true,
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.goosepaint.app",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Goose Paint scans your badge screen through the camera to read its 12x12 pixel pattern."
+      }
+    },
+    "android": {
+      "package": "com.goosepaint.app",
+      "permissions": [
+        "android.permission.CAMERA"
+      ],
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/icon.png",
+        "backgroundColor": "#08090e"
+      }
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "single",
+      "favicon": "./assets/icon.png"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-asset"
+    ],
+    "extra": {
+      "router": {
+        "origin": false
+      }
+    }
+  }
+}

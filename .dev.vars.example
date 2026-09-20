@@ -1,0 +1,29 @@
+# Copy to .dev.vars for local `wrangler pages dev` (gitignored).
+# In production, set these as Cloudflare Pages secrets/env vars instead
+# (Pages dashboard -> your project -> Settings -> Environment variables),
+# never commit real values.
+
+# JSON array of the gas station's 64-byte secret key, e.g. [12,45,...].
+# Get this from .secrets/gas-station-keypair.json after running
+# `npm run gas:generate-key`.
+GAS_STATION_SECRET_KEY=[REPLACE_WITH_SECRET_KEY_ARRAY]
+
+# Base58 pubkey of the compression tree, printed by `npm run gas:create-tree`.
+TREE_ADDRESS=REPLACE_WITH_TREE_ADDRESS
+
+# Optional: override the RPC endpoint (defaults to devnet).
+# SOLANA_RPC_URL=https://api.devnet.solana.com
+
+# Optional: per-IP submissions/minute (default 5 if unset).
+# RATE_LIMIT_MAX_PER_MINUTE=5
+
+# Optional: global submissions/day across all users, as a spend
+# ceiling — unset means no cap. Recommended once real SOL is involved
+# (mainnet); usually unnecessary on devnet.
+# DAILY_SUBMISSION_CAP=500
+
+# Optional: compute-unit price in micro-lamports; 0 (default) disables
+# priority fees entirely, which is fine on devnet. Set a small nonzero
+# value (e.g. 1000) on mainnet so transactions don't stall under
+# congestion — see README's "Moving to mainnet" for the cost math.
+# PRIORITY_FEE_MICROLAMPORTS=0

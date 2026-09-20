@@ -1,0 +1,1792 @@
+<!DOCTYPE html><html class="dark" lang="en" style=""><head>
+<meta charset="utf-8">
+<meta content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" name="viewport">
+<title>Goose Paint Decoder &amp; Solana Submitter</title>
+<!-- Tailwind CSS CDN -->
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<!-- Fonts -->
+<link href="https://fonts.googleapis.com" rel="preconnect">
+<link crossorigin="" href="https://fonts.gstatic.com" rel="preconnect">
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;500;600&amp;display=swap" rel="stylesheet">
+<!-- Google Material Symbols -->
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet">
+<script>
+  // Config bootstrap: native WebView injects window.__GOOSE_PAINT_CONFIG__
+  // directly before this page runs (see constants/decoderHtml.ts +
+  // app/index.tsx). Mobile web instead loads this file as a static asset,
+  // so it can't be pre-injected — it arrives as a query param instead.
+  (function () {
+    if (window.__GOOSE_PAINT_CONFIG__) return;
+    var params = new URLSearchParams(window.location.search);
+    var apiBase = params.get("apiBase") || "";
+    window.__GOOSE_PAINT_CONFIG__ = { apiBase: apiBase };
+  })();
+</script>
+<script>
+  tailwind.config = {
+    darkMode: 'class',
+    theme: {
+      extend: {
+        fontFamily: {
+          sans: ['"Plus Jakarta Sans"', 'system-ui', 'sans-serif'],
+          mono: ['"JetBrains Mono"', 'monospace'],
+        },
+        colors: {
+          obsidian: {
+            950: '#07080c',
+            900: '#0c0e15',
+            850: '#11141f',
+            800: '#171b29',
+            700: '#23293d',
+          },
+          solana: {
+            purple: '#9945FF',
+            teal: '#14F195',
+            cyan: '#00F0FF',
+            dark: '#181424'
+          }
+        },
+        boxShadow: {
+          glow: '0 0 20px -5px rgba(99, 102, 241, 0.35)',
+          'glow-solana': '0 0 25px -4px rgba(153, 69, 255, 0.4), 0 0 15px -2px rgba(20, 241, 149, 0.3)',
+          'inner-bevel': 'inset 0 1px 1px 0 rgba(255, 255, 255, 0.1)',
+        }
+      }
+    }
+  }
+</script>
+<style>
+  /* Base & Custom Utilities */
+  /* html needs the same dark background as body: on mobile browsers the
+     collapsing/expanding URL bar (and the safe-area inset viewport-fit=cover
+     enables above) can reveal a strip of the <html> element's own background
+     beneath body's content, which defaults to white if unset here — that's
+     the white bar some mobile browsers show at the bottom of this page. */
+  html, body {
+    background-color: #08090e;
+  }
+  body {
+    color: #f1f5f9;
+    font-family: 'Plus Jakarta Sans', system-ui, sans-serif;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  /* Canvas and video styling required by engine */
+  /* No aspect-ratio was set here before, so the video's rendered height
+     came entirely from whatever aspect ratio the camera stream reports —
+     on iOS, the rear camera (facingMode: "environment") often reports a
+     tall native resolution, which combined with width:100% and no height
+     cap made the viewport render much taller than intended. Capping it at
+     16:9 with object-fit: cover keeps a consistent, compact preview box
+     regardless of the actual stream's native aspect ratio. This crop DOES
+     matter for scanning: captureAndScan() replicates this same
+     object-fit: cover center-crop (see coverCropRect) before reading
+     pixels, so the corner-detection/homography pipeline only ever sees
+     the same framing the person saw and aimed the 4 corner squares
+     within — not extra field-of-view from the camera's full native frame
+     that was never visible on screen. */
+  video, canvas.snap {
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    object-fit: cover;
+    border-radius: 12px;
+    background: #050608;
+    margin: 8px 0;
+  }
+
+  /* Grid styles configured for display-only badge inspection (upload/scan tab) */
+  #grid {
+    display: grid;
+    grid-template-columns: repeat(12, 1fr);
+    gap: 3px;
+    width: 100%;
+    max-width: 360px;
+    aspect-ratio: 1 / 1;
+    margin: 0 auto;
+    padding: 10px;
+    background: rgba(12, 14, 21, 0.95);
+    border-radius: 18px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    box-shadow: inset 0 2px 10px rgba(0, 0, 0, 0.6), 0 10px 25px -5px rgba(0, 0, 0, 0.5);
+  }
+  .cell {
+    aspect-ratio: 1 / 1;
+    border-radius: 3.5px;
+    box-sizing: border-box;
+    cursor: default;
+    user-select: none;
+    transition: background-color 0.2s ease, border-color 0.2s ease;
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    position: relative;
+  }
+  .badrow {
+    outline: 2px solid #f43f5e !important;
+    box-shadow: 0 0 8px rgba(244, 63, 94, 0.6);
+    z-index: 2;
+  }
+  .badcol {
+    outline: 2px solid #f59e0b !important;
+    box-shadow: 0 0 8px rgba(245, 158, 11, 0.6);
+    z-index: 2;
+  }
+  .badrow.badcol {
+    outline: 2.5px solid #ec4899 !important;
+    box-shadow: 0 0 10px rgba(236, 72, 153, 0.75);
+    z-index: 3;
+  }
+
+  /* Feed grid: same 12x12 layout, smaller/denser, no bad-checksum outline
+     styling needed since only checksum-valid images ever land on chain. */
+  .feed-grid {
+    display: grid;
+    grid-template-columns: repeat(12, 1fr);
+    gap: 1.5px;
+    background: #0b0c11;
+    padding: 3px;
+    border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.06);
+  }
+  .feed-cell {
+    aspect-ratio: 1 / 1;
+    border-radius: 1.5px;
+  }
+
+  /* Custom terminal status formatting */
+  #status {
+    font-family: 'JetBrains Mono', monospace;
+    white-space: pre-wrap;
+    line-height: 1.45;
+  }
+
+  .tab-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    padding: 0.5rem 1rem;
+    font-size: 0.875rem;
+    font-weight: 500;
+    border-radius: 9999px;
+    white-space: nowrap;
+    transition: color 0.15s ease, background-color 0.15s ease, border-color 0.15s ease;
+    color: #a1a1aa;
+    border: 1px solid transparent;
+  }
+  .tab-btn:hover { color: #ffffff; }
+  .tab-btn.active {
+    background: rgba(16, 185, 129, 0.15);
+    color: #34d399;
+    border-color: rgba(16, 185, 129, 0.3);
+    box-shadow: 0 0 12px rgba(16, 185, 129, 0.2);
+  }
+</style>
+</head>
+<body class="min-h-screen bg-obsidian-950 text-slate-100 flex flex-col items-center pb-28 selection:bg-solana-purple selection:text-white">
+<!-- Mobile Top Navigation Header -->
+<header class="w-full sticky top-0 z-40 bg-obsidian-950/85 backdrop-blur-xl border-b border-white/10 px-4 py-3">
+<div class="max-w-md mx-auto flex items-center justify-between">
+<div class="flex items-center gap-3">
+<!-- Wordmark, matching the desktop handoff screen's GOOSE//PAINT branding
+     (components/DesktopHandoff.tsx) rather than a separate icon+title. -->
+<div>
+<div class="flex items-center gap-2">
+<span class="w-2 h-2 rounded-full bg-emerald-400 flex-shrink-0"></span>
+<h1 class="text-sm font-semibold tracking-[0.2em] text-slate-200 m-0 leading-none font-mono">GOOSE//PAINT</h1>
+</div>
+<p class="text-xs text-slate-400 m-0 mt-1">Badge Decoder &amp; On-Chain Broadcaster</p>
+</div>
+</div>
+</div>
+</header>
+<!-- Main Responsive Container -->
+<main class="w-full max-w-md px-4 pt-4 flex flex-col gap-5">
+
+<!-- ============================================== -->
+<!-- SECTION: DOOMSCROLL FEED ("DRAWINGS")          -->
+<!-- ============================================== -->
+<section class="flex flex-col gap-4" id="feedSection">
+  <div id="feedList" class="flex flex-col gap-4"></div>
+  <div class="py-6 flex flex-col items-center justify-center text-center text-slate-500 text-xs font-mono" id="feedStatus">
+    <div class="w-5 h-5 border-2 border-emerald-400 border-t-transparent rounded-full animate-spin mb-2"></div>
+    <span>Syncing on-chain badge blocks...</span>
+  </div>
+  <button class="mx-auto text-[11px] font-mono text-slate-400 hover:text-slate-200 bg-slate-800/70 px-3 py-1.5 rounded-full border border-slate-700 hidden" id="feedLoadMoreBtn" type="button">
+    Load more
+  </button>
+</section>
+
+<!-- ============================================== -->
+<!-- SECTION: UPLOAD / SCAN                         -->
+<!-- ============================================== -->
+<section class="hidden flex-col gap-5" id="uploadSection">
+<!-- CARD 1: Camera & Badge Scanner -->
+<div class="bg-obsidian-900/90 border border-white/10 rounded-2xl p-4 shadow-xl relative overflow-hidden backdrop-blur-md">
+<!-- Ambient Glow Top Edge -->
+<div class="absolute -top-12 left-1/2 -translate-x-1/2 w-48 h-24 bg-purple-500/15 blur-3xl pointer-events-none"></div>
+<div class="flex items-center gap-2 mb-3">
+<span class="material-symbols-outlined text-purple-400 text-lg">photo_camera</span>
+<h2 class="text-sm font-semibold tracking-wide uppercase text-slate-200">Hardware Scanner</h2>
+</div>
+<p class="text-xs text-slate-400 mb-3 leading-relaxed">
+  Align the 4 corner squares of your badge screen in frame to auto-rectify and extract pixel matrix data.
+</p>
+<!-- Viewport Feed Area -->
+<div class="relative rounded-xl overflow-hidden bg-black border border-white/10 mb-3 min-h-[44px] flex flex-col items-center justify-center" id="viewfinderWrapper">
+<!-- Target Reticle Overlay -->
+<div class="absolute inset-0 pointer-events-none z-10 flex flex-col justify-between p-3 opacity-40">
+<div class="flex justify-between">
+<div class="w-5 h-5 border-t-2 border-l-2 border-teal-400 rounded-tl-sm"></div>
+<div class="w-5 h-5 border-t-2 border-r-2 border-teal-400 rounded-tr-sm"></div>
+</div>
+<div class="flex justify-between">
+<div class="w-5 h-5 border-b-2 border-l-2 border-teal-400 rounded-bl-sm"></div>
+<div class="w-5 h-5 border-b-2 border-r-2 border-teal-400 rounded-br-sm"></div>
+</div>
+</div>
+<!-- Video & Canvas elements with exact IDs -->
+<video id="video" muted="" playsinline="" style="display:none"></video>
+<canvas class="snap" id="snap" style="display:none"></canvas>
+<canvas class="snap" id="flat" style="display:none"></canvas>
+<div class="py-5 text-center px-4 text-slate-500 text-xs flex flex-col items-center gap-1.5" id="camPlaceholder">
+<span class="material-symbols-outlined text-2xl text-slate-600">videocam_off</span>
+<span class="">Camera stream is inactive</span>
+</div>
+<!-- Shown in the "review" state only when corner detection failed, so
+     there's no rectified image to display and the raw captured photo is
+     intentionally not shown either (see setCamState). -->
+<div class="py-5 text-center px-4 text-slate-500 text-xs flex flex-col items-center gap-1.5" id="noRectifiedPlaceholder" style="display:none">
+<span class="material-symbols-outlined text-2xl text-slate-600">crop_free</span>
+<span class="">No rectified preview available — corners weren't found, but the raw photo was still OCR'd.</span>
+</div>
+</div>
+<!-- Single scanner control: cycles Start Camera -> Capture -> Retake.
+     See camState/setCamState in the script below for the state machine;
+     capturing immediately triggers OCR with no separate "Scan" step. -->
+<button class="w-full flex items-center justify-center gap-2 py-2.5 px-3 rounded-xl bg-slate-800/90 hover:bg-slate-700/80 active:scale-[0.98] border border-white/10 text-slate-200 text-xs font-semibold transition-all shadow-sm" id="camBtn" type="button">
+<span class="material-symbols-outlined text-sm text-purple-400" id="camBtnIcon">videocam</span>
+<span id="camBtnLabel">Start Camera</span>
+</button>
+</div>
+<!-- CARD 2: Manual Code Input & Telemetry Status -->
+<div class="bg-obsidian-900/90 border border-white/10 rounded-2xl p-4 shadow-xl backdrop-blur-md">
+<div class="flex items-center justify-between mb-2">
+<div class="flex items-center gap-2">
+<span class="material-symbols-outlined text-teal-400 text-lg">data_object</span>
+<h2 class="text-sm font-semibold tracking-wide uppercase text-slate-200">Raw Code Input</h2>
+</div>
+<div class="flex gap-1.5">
+<button class="text-[11px] font-mono text-slate-400 hover:text-slate-200 bg-slate-800 px-2 py-0.5 rounded border border-slate-700 active:scale-95 transition" onclick="document.getElementById('code').value=''; document.getElementById('code').focus();" type="button">Clear</button>
+</div>
+</div>
+<p class="text-xs text-slate-400 mb-2 leading-relaxed">
+  Or paste the 169-character encoded string (spaces and breaks ignored):
+</p>
+<!-- Code Textarea -->
+<div class="relative mb-3">
+<textarea class="w-full h-24 p-3 font-mono text-xs text-teal-200 placeholder-slate-600 bg-obsidian-950/90 border border-white/15 rounded-xl focus:border-teal-400 focus:ring-1 focus:ring-teal-400 outline-none resize-none transition-all shadow-inner" id="code" placeholder="GP1X XXXX ..." spellcheck="false"></textarea>
+</div>
+<!-- Action Button -->
+<div>
+<button class="w-full flex items-center justify-center gap-2 py-3 px-4 rounded-xl bg-gradient-to-r from-purple-600 via-indigo-600 to-purple-600 hover:brightness-110 active:scale-[0.98] text-white text-sm font-bold shadow-lg shadow-purple-600/30 border border-purple-400/30 transition-all" id="decodeBtn" type="button">
+<span class="material-symbols-outlined text-base">auto_fix_high</span>
+<span class="">Decode Pattern</span>
+</button>
+</div>
+<!-- Telemetry Output Box -->
+<div class="mt-3 p-3 bg-obsidian-950 border border-white/5 rounded-xl overflow-x-auto">
+<div class="flex items-center justify-between pb-1.5 mb-1.5 border-b border-white/5 text-[10px] font-mono text-slate-500">
+<span class="flex items-center gap-1"><span class="w-1.5 h-1.5 rounded-full bg-slate-500"></span>PARITY CHECKS</span>
+<span class="text-slate-600">MOD 17</span>
+</div>
+<div class="text-xs text-slate-300 min-h-[20px]" id="status">Scan a badge or paste a code to begin.</div>
+</div>
+</div>
+<!-- CARD 3: 12x12 Decoded Matrix & Solana Broadcast -->
+<div class="bg-obsidian-900/90 border border-white/10 rounded-2xl p-4 shadow-xl backdrop-blur-md relative overflow-hidden">
+<div class="flex items-center justify-between mb-3">
+<div class="flex items-center gap-2">
+<span class="material-symbols-outlined text-teal-400 text-lg">view_in_ar</span>
+<h2 class="text-sm font-semibold tracking-wide uppercase text-slate-200">Decoded Badge Matrix</h2>
+</div>
+<div class="flex items-center gap-2">
+<span class="text-[10px] font-mono px-2 py-0.5 rounded bg-purple-950/70 border border-purple-500/30 text-purple-300">READ-ONLY</span>
+<span class="text-[11px] font-mono px-2 py-0.5 rounded bg-slate-800/80 border border-white/5 text-slate-400">12 × 12 (144 px)</span>
+</div>
+</div>
+<p class="text-xs text-slate-400 mb-3">
+  Direct badge screen telemetry representation. Verified pixels are sealed and broadcasted immutable to Solana.
+</p>
+<!-- Pixel Grid Element with exact ID (Display-Only Preview Matrix) -->
+<div class="flex justify-center mb-4">
+<div id="grid"></div>
+</div>
+<!-- Web3 / Solana Submission Section -->
+<div class="border-t border-white/10 pt-4 flex flex-col gap-3">
+<!-- Solana Submit Action Button -->
+<button class="relative group overflow-hidden w-full flex items-center justify-center gap-2.5 py-3.5 px-4 rounded-xl bg-gradient-to-r from-[#9945FF] via-[#7B2BF9] to-[#14F195] hover:brightness-110 active:scale-[0.98] disabled:opacity-40 disabled:pointer-events-none text-white text-sm font-bold shadow-glow-solana transition-all" disabled id="solanaSubmitBtn" type="button">
+<!-- Official Solana Vector Logo -->
+<svg class="w-5 h-4 flex-shrink-0 drop-shadow" fill="none" viewBox="0 0 397 311" xmlns="http://www.w3.org/2000/svg">
+<path clip-rule="evenodd" d="M64.6 237.9c2.4-2.4 5.7-3.8 9.2-3.8h317.4c5.8 0 8.7 7 4.6 11.1l-62.7 62.7c-2.4 2.4-5.7 3.8-9.2 3.8H6.5c-5.8 0-8.7-7-4.6-11.1l62.7-62.7zM64.6 3.8C67 1.4 70.3 0 73.8 0h317.4c5.8 0 8.7 7 4.6 11.1l-62.7 62.7c-2.4 2.4-5.7 3.8-9.2 3.8H6.5c-5.8 0-8.7-7-4.6-11.1L64.6 3.8zm267.8 115.1c-2.4-2.4-5.7-3.8-9.2-3.8H5.8c-5.8 0-8.7 7-4.6 11.1l62.7 62.7c2.4 2.4 5.7 3.8 9.2 3.8h317.4c5.8 0 8.7-7 4.6-11.1l-62.7-62.7z" fill="currentColor" fill-rule="evenodd"></path>
+</svg>
+<span id="submitBtnLabel" class="">Publish New Image</span>
+</button>
+<!-- Context note for Doomscroll Viewer App -->
+<div class="px-2 pt-0.5 text-center">
+<p class="text-[11px] text-slate-400 leading-normal m-0">
+  Decoded badge patterns are broadcast live to the Solana on-chain stream for the <span class="text-teal-300 font-medium cursor-pointer hover:underline" onclick="switchToTab('feed')">Drawings tab</span>.
+</p>
+</div>
+<!-- On-chain Transaction Toast / Status Box (Dynamic) -->
+<div class="hidden p-3 rounded-xl bg-purple-950/40 border border-purple-500/30 font-mono text-xs flex-col gap-1.5 transition-all" id="solanaTxCard">
+<div class="flex items-center justify-between">
+<span class="text-solana-teal flex items-center gap-1 font-semibold">
+<span class="material-symbols-outlined text-sm">verified</span> Confirmed On-Chain
+</span>
+<span class="text-[10px] text-slate-400" id="txSlot">Slot #—</span>
+</div>
+<div class="flex items-center justify-between text-[11px] text-slate-300 bg-obsidian-950/80 px-2 py-1.5 rounded border border-white/5">
+<span class="text-slate-500">TX:</span>
+<span class="text-purple-300 truncate max-w-[210px]" id="txSig" title="">—</span>
+<button class="text-teal-400 hover:text-teal-300 ml-1 text-[10px]" onclick="copyTxSignature()" type="button">Copy</button>
+</div>
+<div class="text-[10px] text-slate-400 flex items-center justify-between">
+<span class="">Feed payload: 144 nibbles</span>
+<span class="text-emerald-400 cursor-pointer hover:underline" onclick="switchToTab('feed')">View in Drawings →</span>
+</div>
+</div>
+</div>
+</div>
+</section>
+</main>
+
+<!-- ============================================== -->
+<!-- FLOATING BOTTOM NAVIGATION BAR                 -->
+<!-- ============================================== -->
+<div class="fixed bottom-6 left-0 right-0 z-50 flex justify-center items-center pointer-events-none px-4">
+<nav class="pointer-events-auto flex items-center bg-[#15161c]/90 backdrop-blur-xl border border-white/10 p-1.5 rounded-full shadow-2xl shadow-black/80 gap-1.5 min-w-[320px] max-w-md w-full justify-between">
+<button class="tab-btn flex-1 active" id="tabFeedBtn" type="button" onclick="switchToTab('feed')">
+<span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse flex-shrink-0"></span>
+<span class="material-symbols-outlined text-base">grid_view</span>
+<span class="whitespace-nowrap">Drawings</span>
+</button>
+<button class="tab-btn flex-1" id="tabUploadBtn" type="button" onclick="switchToTab('upload')">
+<span class="material-symbols-outlined text-base">document_scanner</span>
+<span class="whitespace-nowrap">Upload / Scan</span>
+</button>
+</nav>
+</div>
+
+<!-- EXACT Tesseract Script Tag Required -->
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<script>
+const ALPHA = "XAEFHKLMNPRTYJ479";
+// Canonical 17-color badge palette (index 0 = white/blank). This is the
+// only palette the encoding is defined against — do not swap in a
+// different palette without re-deriving how badges map colors to codes,
+// since every already-programmed badge assumes this exact table.
+const COLORS = [0xffffff,
+  0x000000, 0xe53935, 0xfb8c00, 0xfdd835,
+  0x43a047, 0x26a69a, 0x00acc1, 0x1e88e5,
+  0x5e35b1, 0xd81b60, 0x8d6e63, 0x9e9e9e,
+  0xffab91, 0xa5d6a7, 0x90caf9, 0xce93d8];
+const N = 12;
+const FW = 640, FH = 480;         // flattened screen size (2x the 320x240 badge)
+let pix = new Array(N * N).fill(0);
+let badRows = new Set(), badCols = new Set();
+let lastDecodedPayload = "";
+let lastDecodeOk = false;
+const hex = c => "#" + c.toString(16).padStart(6, "0");
+const $ = id => document.getElementById(id);
+
+function apiBase() {
+  return (window.__GOOSE_PAINT_CONFIG__ && window.__GOOSE_PAINT_CONFIG__.apiBase) || "";
+}
+
+// ---- decoding the text ----
+
+// Runs the mod-17 row/column/total checksum validation against a 169-char
+// value array (v[i] = ALPHA index of character i, or undefined if that
+// position couldn't be mapped to a known letter) and returns which rows,
+// columns, and the total check failed — without mutating any shared
+// state. Factored out of decode() so the auto-correction pass below can
+// try a trial substitution and re-check it cheaply, without duplicating
+// this logic or touching the real badRows/badCols/pix state until a
+// correction is actually accepted.
+function validate(v) {
+  const badRows = new Set(), badCols = new Set();
+  const cell = new Array(N * N).fill(0);
+  for (let y = 0; y < N; y++) {
+    let sum = 0;
+    for (let x = 0; x < N; x++) {
+      const val = v[y * 13 + x] ?? 0;
+      cell[y * N + x] = val;
+      sum += val;
+    }
+    const chk = v[y * 13 + 12];
+    if (chk === undefined || sum % 17 !== chk) badRows.add(y);
+  }
+  let total = 0;
+  for (let x = 0; x < N; x++) {
+    let sum = 0;
+    for (let y = 0; y < N; y++) sum += cell[y * N + x];
+    total += sum;
+    const chk = v[156 + x];
+    if (chk === undefined || sum % 17 !== chk) badCols.add(x);
+  }
+  const totalOk = v[168] !== undefined && total % 17 === v[168];
+  return { badRows, badCols, totalOk, cell };
+}
+
+// Attempts to fix single-character OCR mistakes using the checksums
+// themselves as ground truth, rather than only reporting that something's
+// wrong. Every one of the 144 data cells participates in exactly one row
+// checksum, one column checksum, and the total checksum; a row or column's
+// own checksum character participates only in that one check. That means
+// a single wrong character breaks a small, specific, predictable set of
+// checks — which is exactly the structure needed to search for "what one
+// change would make this check pass without breaking anything else."
+//
+// For each failing row, this tries every (position in that row) x (every
+// alphabet letter) substitution and keeps only ones that fix the row
+// without breaking a column or the total that was previously fine. If
+// exactly one such fix exists for a row, it's applied — high confidence,
+// since a coincidental second unrelated error would be needed to produce
+// a false positive. If none or multiple candidate fixes exist, that row
+// is left alone rather than guessed at; ambiguous corrections are worse
+// than an honest "please re-scan." The same then runs for failing
+// columns using whatever the row pass already fixed.
+function autoCorrect(v) {
+  const original = validate(v);
+  let corrected = v.slice();
+  let anyFix = false;
+
+  function tryFixRow(y) {
+    const candidates = [];
+    for (let pos = y * 13; pos < y * 13 + 13; pos++) {
+      const isRowChecksumPos = (pos % 13 === 12);
+      // A bad column can only be caused by a bad DATA cell -- column sums
+      // never read a row's own checksum character. So if any column is
+      // already flagged bad, this row's checksum char can't be the real
+      // culprit: including it here just adds a spurious second "fix" that
+      // makes the row look consistent with already-corrupted data,
+      // turning an unambiguous single-candidate fix into a false tie.
+      if (isRowChecksumPos && original.badCols.size > 0) continue;
+      for (let letter = 0; letter < ALPHA.length; letter++) {
+        if (corrected[pos] === letter) continue;
+        const trial = corrected.slice();
+        trial[pos] = letter;
+        const check = validate(trial);
+        if (check.badRows.has(y)) continue; // didn't even fix this row
+        // Don't accept a "fix" that breaks something else that was fine.
+        const brokeAnotherRow = [...check.badRows].some((r) => r !== y && !original.badRows.has(r));
+        const brokeAColumn = [...check.badCols].some((c) => !original.badCols.has(c));
+        const brokeTotal = original.totalOk && !check.totalOk;
+        if (brokeAnotherRow || brokeAColumn || brokeTotal) continue;
+        candidates.push({ pos, letter });
+      }
+    }
+    if (candidates.length === 1) {
+      corrected[candidates[0].pos] = candidates[0].letter;
+      anyFix = true;
+    }
+  }
+
+  function tryFixCol(x) {
+    const positions = [];
+    for (let y = 0; y < N; y++) positions.push(y * 13 + x); // 12 data cells
+    // Symmetric to tryFixRow: a bad row can only be caused by a bad DATA
+    // cell, so if any row is already flagged bad, this column's own
+    // checksum char (156+x) can't be the real culprit -- only consider it
+    // when no row is flagged, otherwise it creates the same false tie.
+    if (original.badRows.size === 0) positions.push(156 + x);
+    const candidates = [];
+    for (const pos of positions) {
+      for (let letter = 0; letter < ALPHA.length; letter++) {
+        if (corrected[pos] === letter) continue;
+        const trial = corrected.slice();
+        trial[pos] = letter;
+        const check = validate(trial);
+        if (check.badCols.has(x)) continue;
+        const brokeAnotherCol = [...check.badCols].some((c) => c !== x && !original.badCols.has(c));
+        const brokeARow = [...check.badRows].some((r) => !original.badRows.has(r));
+        const brokeTotal = original.totalOk && !check.totalOk;
+        if (brokeAnotherCol || brokeARow || brokeTotal) continue;
+        candidates.push({ pos, letter });
+      }
+    }
+    if (candidates.length === 1) {
+      corrected[candidates[0].pos] = candidates[0].letter;
+      anyFix = true;
+    }
+  }
+
+  for (const y of original.badRows) tryFixRow(y);
+  for (const x of original.badCols) tryFixCol(x);
+
+  // A single corrupted TOTAL-checksum character shows up as every row and
+  // column passing, but the grand total mismatching -- the only possible
+  // culprit is v[168] itself, so just search for the letter that makes it
+  // agree with the (already-trusted) row/column checksums.
+  if (original.badRows.size === 0 && original.badCols.size === 0 && !original.totalOk) {
+    for (let letter = 0; letter < ALPHA.length; letter++) {
+      if (corrected[168] === letter) continue;
+      const trial = corrected.slice();
+      trial[168] = letter;
+      if (validate(trial).totalOk) {
+        corrected[168] = letter;
+        anyFix = true;
+        break;
+      }
+    }
+  }
+
+  return { corrected, anyFix };
+}
+
+function decode(text, opts) {
+  opts = opts || {};
+  const msgs = [];
+  // Keep only alphabet characters. The tag "GP1" leaves a single "P".
+  let s = text.toUpperCase().replace(/[^XAEFHKLMNPRTYJ479]/g, "");
+  if (s.length === 170 && s[0] === "P") s = s.slice(1);   // tag remnant
+  if (s.length > 169) s = s.slice(s.length - 169);        // keep the tail
+  if (s.length !== 169)
+    msgs.push("Expected 169 data characters, got " + s.length +
+              ". Fix the text or re-scan.");
+  let v = s.split("").map(ch => ALPHA.indexOf(ch)).map((i) => (i < 0 ? undefined : i));
+
+  let didAutoCorrect = false;
+  if (opts.glyphScores && s.length === 169 && v.every((x) => x !== undefined)) {
+    // Scanned by the glyph matcher: repairs are chosen from the symbols it
+    // actually ranked highly, so a fix has to look right as well as add up.
+    const before = validate(v);
+    if (before.badRows.size || before.badCols.size || !before.totalOk) {
+      const res = FIX.correct(v, opts.glyphScores, ALPHA);
+      if (res && res.v && res.v.some((x, i) => x !== v[i])) {
+        v = res.v;
+        s = v.map((i) => ALPHA[i] ?? "?").join("");
+        didAutoCorrect = true;
+      }
+    }
+  } else if (opts.autoCorrect && s.length === 169) {
+    const initial = validate(v);
+    if (initial.badRows.size || initial.badCols.size) {
+      const { corrected, anyFix } = autoCorrect(v);
+      if (anyFix) {
+        v = corrected;
+        s = v.map((i) => ALPHA[i] ?? "?").join("");
+        didAutoCorrect = true;
+      }
+    }
+  }
+
+  const { badRows: newBadRows, badCols: newBadCols, totalOk, cell } = validate(v);
+  badRows = newBadRows; badCols = newBadCols;
+  pix = cell;
+  lastDecodedPayload = s;
+
+  const submitBtn = $("solanaSubmitBtn");
+
+  if (didAutoCorrect) msgs.push("Auto-corrected " + "a likely OCR misread using the checksums.");
+  if (badRows.size) msgs.push("Rows to check: " + [...badRows].map(r => r + 1).join(", "));
+  if (badCols.size) msgs.push("Columns to check: " + [...badCols].map(c => c + 1).join(", "));
+
+  lastDecodeOk = s.length === 169 && !badRows.size && !badCols.size && totalOk;
+
+  if (lastDecodeOk) {
+    msgs.push("All checks passed. Matrix verified ready for Solana broadcast.");
+  } else if (!totalOk) {
+    msgs.push("Total check does not match.");
+  }
+  // Only a checksum-clean matrix is allowed on-chain: the gas station
+  // re-validates server-side too, but gating the button here avoids
+  // burning a free submission slot on a scan the server will reject.
+  if (submitBtn) submitBtn.disabled = !lastDecodeOk;
+  $("status").textContent = msgs.join("\n");
+  render();
+}
+
+// Display-Only preview matrix renderer (no painting/interaction click handlers)
+function render() {
+  const g = $("grid");
+  g.innerHTML = "";
+  pix.forEach((val, i) => {
+    const d = document.createElement("div");
+    const x = i % N, y = Math.floor(i / N);
+    d.className = "cell" + (badRows.has(y) ? " badrow" : "") + (badCols.has(x) ? " badcol" : "");
+    d.style.background = hex(COLORS[val] ?? 0xffffff);
+    // Display-only inspection matrix: no manual click-to-paint attached
+    g.appendChild(d);
+  });
+}
+
+$("decodeBtn").onclick = () => decode($("code").value);
+
+// ---- finding the four corner squares and flattening the screen ----
+//
+// The badge firmware (see the Lua source) draws four solid white 20x20
+// squares at the four corners of its 320x240 screen, specifically so this
+// step can find them and undo whatever rotation/perspective the camera
+// introduced. The original approach here searched a fixed quadrant of the
+// *entire captured frame* for the brightest pixels and assumed that was
+// "the" corner square for that quadrant — which only works when the badge
+// fills nearly the whole frame and is held close to upright. The moment
+// the badge is smaller, off-center, or at a real angle (the normal case
+// for a handheld phone shot), a frame-quadrant boundary has no
+// relationship to where the badge's actual corners are, and this could
+// silently pick up the wrong bright region (part of a different corner
+// square, a reflection, background light) without ever failing outright,
+// producing a badly warped "flattened" image like the one that prompted
+// this rewrite.
+//
+// This replaces that with real connected-component (blob) detection
+// across the WHOLE frame: find every distinct bright blob, keep the ones
+// shaped and sized like a corner marker, then take the best 4 and
+// classify them into top-left/top-right/bottom-left/bottom-right by their
+// position relative to each other — not by which quadrant of the frame
+// they happen to land in. This works regardless of where in the frame the
+// badge actually is, how large it is, or how it's rotated.
+function findCornerBlobs(img) {
+  const w = img.width, h = img.height, d = img.data;
+
+  // Sample brightness at every pixel (no downscale here — accuracy of the
+  // blob's true extent matters more than raw speed at this stage, and a
+  // typical phone photo is small enough that this is still fast).
+  const gray = new Uint8ClampedArray(w * h);
+  for (let i = 0, p = 0; i < d.length; i += 4, p++) {
+    gray[p] = (d[i] + d[i + 1] + d[i + 2]) / 3;
+  }
+
+  // A global percentile threshold (rather than a fixed brightness value)
+  // adapts to the actual photo's lighting/exposure, same intent as the
+  // original per-quadrant threshold, just computed once over the whole
+  // frame instead of once per assumed-quadrant.
+  const sorted = Uint8Array.from(gray).sort();
+  const thr = sorted[Math.floor(sorted.length * 0.97)] || 255;
+
+  // Flood-fill (iterative, explicit stack — recursion would blow the
+  // stack on a large bright region like an overexposed sky) every bright
+  // pixel into its connected blob, 4-connected is enough for compact
+  // squares and keeps this cheap.
+  const visited = new Uint8Array(w * h);
+  const blobs = [];
+  const stackX = new Int32Array(w * h);
+  const stackY = new Int32Array(w * h);
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const idx = y * w + x;
+      if (visited[idx] || gray[idx] < thr) continue;
+
+      let sp = 0;
+      stackX[sp] = x; stackY[sp] = y; sp++;
+      visited[idx] = 1;
+
+      let minX = x, maxX = x, minY = y, maxY = y, count = 0, sx = 0, sy = 0;
+
+      while (sp > 0) {
+        sp--;
+        const cx = stackX[sp], cy = stackY[sp];
+        count++; sx += cx; sy += cy;
+        if (cx < minX) minX = cx;
+        if (cx > maxX) maxX = cx;
+        if (cy < minY) minY = cy;
+        if (cy > maxY) maxY = cy;
+
+        const neighbors = [
+          [cx + 1, cy], [cx - 1, cy], [cx, cy + 1], [cx, cy - 1],
+        ];
+        for (const [nx, ny] of neighbors) {
+          if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
+          const nidx = ny * w + nx;
+          if (visited[nidx] || gray[nidx] < thr) continue;
+          visited[nidx] = 1;
+          stackX[sp] = nx; stackY[sp] = ny; sp++;
+        }
+      }
+
+      // Filter to blobs shaped/sized like one of the badge's 20x20 corner
+      // squares. Real-world scale varies with camera distance, so this is
+      // deliberately generous on size (a wide but plausible pixel-area
+      // range) while still being strict on shape: a genuine square marker
+      // has near-equal width and height and is reasonably filled-in
+      // (count close to its bounding box area) — this rejects long thin
+      // reflections/glare streaks and large overexposed regions that
+      // would otherwise pass a size check alone.
+      const bw = maxX - minX + 1, bh = maxY - minY + 1;
+      const boxArea = bw * bh;
+      const fillRatio = count / boxArea;
+      const aspect = bw / bh;
+      const plausibleSize = boxArea >= 20 && boxArea <= (w * h) / 8;
+      const plausibleShape = fillRatio > 0.55 && aspect > 0.5 && aspect < 2;
+
+      if (plausibleSize && plausibleShape) {
+        blobs.push({ x: sx / count, y: sy / count, area: boxArea });
+      }
+    }
+  }
+
+  return blobs;
+}
+
+// Given candidate blobs (usually more than 4 — background clutter can
+// produce plausible-looking blobs too), pick the best 4 and classify them
+// as tl/tr/bl/br by position. Corner-marker squares are typically among
+// the largest clean blobs in frame, so preferring larger candidates when
+// there are more than 4 is a reasonable heuristic; classifying strictly
+// by position (leftmost-two vs rightmost-two, then top vs bottom within
+// each pair) works regardless of the badge's rotation within the frame,
+// as long as that rotation is mild (a real photo, not a photo taken
+// sideways) — which matches what the on-screen scanning guidance asks for.
+function classifyCorners(blobs) {
+  if (blobs.length < 4) return null;
+
+  const top4 = [...blobs].sort((a, b) => b.area - a.area).slice(0, 4);
+  const byX = [...top4].sort((a, b) => a.x - b.x);
+  const left2 = byX.slice(0, 2).sort((a, b) => a.y - b.y);
+  const right2 = byX.slice(2, 4).sort((a, b) => a.y - b.y);
+
+  const tl = left2[0], bl = left2[1];
+  const tr = right2[0], br = right2[1];
+
+  // Sanity-check the resulting quad before trusting it. If the badge isn't
+  // fully in frame (a corner square cropped out or hidden), or a big glare
+  // streak got flood-filled into a blob large enough to out-rank a real
+  // corner, "top 4 by area" can end up with fewer than 4 genuine corner
+  // squares. There's no way to detect that from blob shape alone once it's
+  // already past the per-blob filter in findCornerBlobs, but a quad built
+  // from real corners has known structure: roughly parallel top/bottom
+  // edges, a sane aspect ratio, and actual left-to-right / top-to-bottom
+  // separation. A glare-derived "corner" tends to break at least one of
+  // these badly. Rejecting here and returning null falls back to
+  // whole-image OCR (see captureAndScan) -- a blurrier but honest read
+  // beats a confidently wrong perspective warp.
+  if (!isPlausibleQuad(tl, tr, bl, br)) return null;
+
+  return {
+    tl: [tl.x, tl.y], tr: [tr.x, tr.y],
+    bl: [bl.x, bl.y], br: [br.x, br.y],
+  };
+}
+
+function isPlausibleQuad(tl, tr, bl, br) {
+  const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+  const topW = dist(tl, tr), botW = dist(bl, br);
+  const leftH = dist(tl, bl), rightH = dist(tr, br);
+
+  // Degenerate: any two "corners" landed on (near) the same point, which
+  // happens when there weren't actually 4 distinct markers to find.
+  const minSpan = 10;
+  if (topW < minSpan || botW < minSpan || leftH < minSpan || rightH < minSpan) return false;
+
+  // Opposite edges of a real (even steeply angled) badge photo shouldn't
+  // differ wildly in length -- a glare blob standing in for one corner
+  // usually collapses or stretches one edge relative to its opposite.
+  const edgeRatioOk = (a, b) => {
+    const r = a / b;
+    return r > 0.35 && r < 2.85;
+  };
+  if (!edgeRatioOk(topW, botW) || !edgeRatioOk(leftH, rightH)) return false;
+
+  // The overall shape should be roughly landscape-ish, matching the
+  // badge's real 320x240 aspect -- not a thin diagonal sliver, which is
+  // what a corner-shaped glare streak typically produces.
+  const avgW = (topW + botW) / 2, avgH = (leftH + rightH) / 2;
+  const aspect = avgW / avgH;
+  if (aspect < 0.5 || aspect > 4.5) return false;
+
+  // The quad should be (approximately) convex / non-self-intersecting: tl
+  // and tr should both sit above bl and br, not interleaved with them.
+  const avgTopY = (tl.y + tr.y) / 2, avgBotY = (bl.y + br.y) / 2;
+  if (avgTopY >= avgBotY) return false;
+
+  return true;
+}
+
+function homography(src, dst) {
+  const A = [], b = [];
+  for (let i = 0; i < 4; i++) {
+    const [x, y] = src[i], [u, v] = dst[i];
+    A.push([x, y, 1, 0, 0, 0, -u * x, -u * y]); b.push(u);
+    A.push([0, 0, 0, x, y, 1, -v * x, -v * y]); b.push(v);
+  }
+  for (let c = 0; c < 8; c++) {
+    let p = c;
+    for (let r = c + 1; r < 8; r++) if (Math.abs(A[r][c]) > Math.abs(A[p][c])) p = r;
+    [A[c], A[p]] = [A[p], A[c]]; [b[c], b[p]] = [b[p], b[c]];
+    for (let r = c + 1; r < 8; r++) {
+      const f = A[r][c] / A[c][c];
+      for (let k = c; k < 8; k++) A[r][k] -= f * A[c][k];
+      b[r] -= f * b[c];
+    }
+  }
+  const h = new Array(8);
+  for (let r = 7; r >= 0; r--) {
+    let s = b[r];
+    for (let k = r + 1; k < 8; k++) s -= A[r][k] * h[k];
+    h[r] = s / A[r][r];
+  }
+  return h;
+}
+
+// ---- glyph templates ----
+// One reference image per alphabet symbol, produced by replaying the real
+// chain (badge screen -> camera optics -> rectifying homography -> the
+// threshold above) so they look like what the scanner actually sees rather
+// than like crisp font renders, which match far worse. The badge's own font
+// was fitted against a real scan at em ~35 canvas px with a ~0.88 horizontal
+// squeeze -- taller and narrower than plain Montserrat 16, and getting that
+// wrong alone cost ~46 points of accuracy. 17 symbols, 30x40 px, 8-bit grey.
+const GLYPH_TPL_B64 = "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";
+
+// Template-matching decoder for the badge code screen.
+//
+// Tesseract reads this screen poorly: it is a blocky bitmap font at a size
+// its English model was never trained on, and thresholding a photo merges
+// neighbouring strokes.  But the badge only ever draws 17 possible symbols
+// in one known font at one known size, so each symbol can be matched
+// directly against a reference image of itself.
+//
+// Glyph advances run from 16 to 31 canvas px, so where each symbol sits
+// depends on the very text being read.  Each line is therefore decoded with
+// a beam search that walks left to right: every candidate is scored with a
+// small local x-jitter and the pen then advances by that candidate's own
+// width, so a wrong guess immediately misaligns everything after it and
+// loses to the right one.  Each comparison is confined to the candidate's
+// own advance width, so a neighbouring glyph cannot contaminate the score.
+
+const GLYPH = (() => {
+  const KEYS = "XAEFHKLMNPRTYJ479";
+  const ADV = { X:20.724, A:22.544, E:20.634, F:19.551, H:25.01, K:22.153, L:18.303, M:29.416, N:25.01, P:22.243, R:22.393, T:18.077, Y:19.927, J:15.806, "4":20.604, "7":18.423, "9":19.009, " ":8.287, G:23.777, "1":11.4 };
+  const CELL_H = 30, CELL_W = 40, PEN_PAD = 7, CAP_ROW = 3, MARGIN = 3;
+  const FW = 640, FH = 480;
+  const LINE_TOP_BADGE = 38, LINE_PITCH_BADGE = 21;
+  const CHARS_PER_LINE = [24,24,24,24,24,24,24,4];
+
+  let TPL = null;   // per-char {lo, w, vec:Float32Array} (centred + unit norm)
+
+  function b64bytes(b64) {
+    if (typeof atob === "function") {
+      const s = atob(b64), a = new Uint8Array(s.length);
+      for (let i = 0; i < s.length; i++) a[i] = s.charCodeAt(i);
+      return a;
+    }
+    return new Uint8Array(Buffer.from(b64, "base64"));
+  }
+
+  function init(b64) {
+    const raw = b64bytes(b64);
+    TPL = {};
+    const per = CELL_H * CELL_W;
+    for (let k = 0; k < KEYS.length; k++) {
+      const c = KEYS[k], off = k * per;
+      const lo = Math.max(0, PEN_PAD - MARGIN);
+      const hi = Math.min(CELL_W, PEN_PAD + Math.round(ADV[c]) + MARGIN);
+      const w = hi - lo;
+      const v = new Float32Array(CELL_H * w);
+      let sum = 0;
+      for (let r = 0; r < CELL_H; r++)
+        for (let j = 0; j < w; j++) {
+          const val = raw[off + r * CELL_W + lo + j];
+          v[r * w + j] = val; sum += val;
+        }
+      const mean = sum / v.length;
+      let nrm = 0;
+      for (let i = 0; i < v.length; i++) { v[i] -= mean; nrm += v[i] * v[i]; }
+      nrm = Math.sqrt(nrm) || 1e-6;
+      for (let i = 0; i < v.length; i++) v[i] /= nrm;
+      TPL[c] = { lo, w, vec: v };
+    }
+  }
+
+  // Match score for every glyph at every integer pen position on one line.
+  // Built once per line: the beam search revisits the same positions many
+  // times, and (because only advances are scaled) it is scale-independent.
+  function scoreTable(band, W) {
+    const K = KEYS.length;
+    const tab = new Float32Array((W + 1) * K).fill(-1);
+    for (let k = 0; k < K; k++) {
+      const t = TPL[KEYS[k]], w = t.w, vec = t.vec, n = CELL_H * w;
+      for (let x = 0; x <= W; x++) {
+        const c0 = x - PEN_PAD + t.lo;
+        if (c0 < 0 || c0 + w > W) continue;
+        let sum = 0, sq = 0, dot = 0;
+        for (let r = 0; r < CELL_H; r++) {
+          const rowOff = r * W + c0, vOff = r * w;
+          for (let j = 0; j < w; j++) {
+            const p = band[rowOff + j];
+            sum += p; sq += p * p; dot += p * vec[vOff + j];
+          }
+        }
+        const mean = sum / n;
+        // vec is already zero-mean, so sum(p*vec) == sum((p-mean)*vec)
+        const varr = sq - n * mean * mean;
+        tab[x * K + k] = varr > 1e-6 ? dot / Math.sqrt(varr) : 0;
+      }
+    }
+    return tab;
+  }
+
+  const JIT = [-2, -1, 0, 1, 2];
+
+  function bestAt(tab, W, x) {
+    const K = KEYS.length;
+    const sc = new Float32Array(K), dj = new Float32Array(K);
+    for (let k = 0; k < K; k++) { sc[k] = -2; dj[k] = 0; }
+    for (const d of JIT) {
+      let xi = Math.round(x + d);
+      if (xi < 0) xi = 0; if (xi > W) xi = W;
+      const base = xi * K;
+      for (let k = 0; k < K; k++) {
+        const v = tab[base + k];
+        if (v > sc[k]) { sc[k] = v; dj[k] = d; }
+      }
+    }
+    return { sc, dj };
+  }
+
+  function slotsFor(n) {
+    const out = [];
+    for (let g = 0; g * 4 < n; g++) {
+      for (let i = 0; i < Math.min(4, n - g * 4); i++) out.push(null);
+      if ((g + 1) * 4 < n) out.push(" ");
+    }
+    return out;
+  }
+
+  function decodeLine(tab, W, n, advScale, startX, prefix, beam) {
+    let hyps = [{ s: 0, x: startX, t: "", pos: [] }];
+    let ci = 0;
+    for (const slot of slotsFor(n)) {
+      if (slot === " ") {
+        for (const h of hyps) h.x += ADV[" "] * advScale;
+        continue;
+      }
+      const forced = (prefix && ci < prefix.length) ? prefix[ci] : null;
+      const nxt = [];
+      for (const h of hyps) {
+        const { sc, dj } = bestAt(tab, W, h.x);
+        if (forced !== null) {
+          const k = KEYS.indexOf(forced);
+          if (k < 0) {  // tag glyph we have no template for: just advance
+            nxt.push({ s: h.s, x: h.x + ADV[forced] * advScale, t: h.t + forced,
+                       pos: h.pos.concat([h.x]) });
+          } else {
+            nxt.push({ s: h.s + sc[k], x: h.x + dj[k] + ADV[forced] * advScale,
+                       t: h.t + forced, pos: h.pos.concat([h.x + dj[k]]) });
+          }
+        } else {
+          for (let k = 0; k < KEYS.length; k++) {
+            const c = KEYS[k];
+            nxt.push({ s: h.s + sc[k], x: h.x + dj[k] + ADV[c] * advScale,
+                       t: h.t + c, pos: h.pos.concat([h.x + dj[k]]) });
+          }
+        }
+      }
+      nxt.sort((a, b) => b.s - a.s);
+      hyps = nxt.slice(0, beam);
+      ci++;
+    }
+    return hyps[0];
+  }
+
+  // Locate a line's true cap-top near where the firmware says it should be.
+  function snapTop(gray, i) {
+    const nom = (LINE_TOP_BADGE + i * LINE_PITCH_BADGE) * 2;
+    let best = null, by = nom;
+    for (let dy = -8; dy <= 8; dy++) {
+      const y = nom + dy;
+      if (y < 0 || y + CELL_H > FH) continue;
+      let first = -1, tot = 0;
+      for (let r = 0; r < CELL_H; r++) {
+        let cnt = 0;
+        for (let x = 0; x < FW; x++) if (gray[(y + r) * FW + x] > 110) cnt++;
+        if (cnt > 3 && first < 0) first = r;
+        tot += cnt;
+      }
+      if (first < 0) continue;
+      const sc = -Math.abs(first - CAP_ROW) * 1000 + tot;
+      if (best === null || sc > best) { best = sc; by = y; }
+    }
+    return by;
+  }
+
+  function decodePayload(gray, opts) {
+    opts = opts || {};
+    const beam = opts.beam || 10;
+    const scales = opts.scales || [0.95, 1.0, 1.05];
+    let text = "";
+    const scores = [];
+    for (let i = 0; i < 8; i++) {
+      const n = CHARS_PER_LINE[i];
+      const y = snapTop(gray, i);
+      const band = new Float32Array(CELL_H * FW);
+      for (let r = 0; r < CELL_H; r++)
+        for (let x = 0; x < FW; x++) band[r * FW + x] = gray[(y + r) * FW + x];
+      let inkL = 40;
+      for (let x = 0; x < FW; x++) {
+        let any = false;
+        for (let r = 0; r < CELL_H && !any; r++) if (band[r * FW + x] > 110) any = true;
+        if (any) { inkL = x; break; }
+      }
+      const tab = scoreTable(band, FW);
+      const pre = i === 0 ? "GP1" : null;
+      let best = null;
+      for (const sc of scales) {
+        const Wx = ADV.X * n * sc + ADV[" "] * sc * Math.floor((n - 1) / 4);
+        const starts = [inkL - 2, inkL, inkL + 2, (FW - Wx) / 2];
+        for (const st of starts) {
+          const h1 = decodeLine(tab, FW, n, sc, st, pre, beam);
+          let Wd = ADV[" "] * sc * Math.floor((n - 1) / 4);
+          for (const ch of h1.t) Wd += (ADV[ch] || 23) * sc;
+          const h2 = decodeLine(tab, FW, n, sc, (FW - Wd) / 2, pre, beam);
+          for (const h of [h1, h2]) if (!best || h.s > best.s) best = h;
+        }
+      }
+      text += best.t;
+      for (const x of best.pos) {
+        const { sc } = bestAt(tab, FW, x);
+        scores.push(sc);
+      }
+    }
+    return { text, scores, keys: KEYS };
+  }
+
+  return { init, decodePayload, KEYS, ADV, CELL_H, CELL_W };
+})();
+
+// Checksum repair over the badge's row/column product code.
+//
+// Every data cell sits in exactly one row check and one column check, so an
+// isolated wrong cell shows up as one failing row AND one failing column and
+// is pinned to their intersection.  Repairs are chosen from the symbols the
+// matcher actually ranked highly, so a fix has to be visually plausible as
+// well as arithmetically consistent - otherwise the checksums can be
+// satisfied by a value the image never supported, producing a grid that
+// validates but is wrong.
+
+const FIX = (() => {
+  const N = 12, MOD = 17;
+
+  function status(v) {
+    const badRows = [], badCols = [];
+    for (let y = 0; y < N; y++) {
+      let s = 0;
+      for (let x = 0; x < N; x++) s += v[y * 13 + x];
+      if (s % MOD !== v[y * 13 + 12]) badRows.push(y);
+    }
+    let tot = 0;
+    for (let x = 0; x < N; x++) {
+      let s = 0;
+      for (let y = 0; y < N; y++) s += v[y * 13 + x];
+      tot += s;
+      if (s % MOD !== v[156 + x]) badCols.push(x);
+    }
+    return { badRows, badCols, totalOk: tot % MOD === v[168] };
+  }
+
+  function nViol(v) {
+    const st = status(v);
+    return st.badRows.length + st.badCols.length + (st.totalOk ? 0 : 1);
+  }
+
+  function suspects(st) {
+    const s = new Set();
+    for (const y of st.badRows) {
+      s.add(y * 13 + 12);
+      for (let x = 0; x < N; x++) s.add(y * 13 + x);
+    }
+    for (const x of st.badCols) {
+      s.add(156 + x);
+      for (let y = 0; y < N; y++) s.add(y * 13 + x);
+    }
+    if (!st.totalOk) s.add(168);
+    return [...s];
+  }
+
+  // Arithmetic-only fallback: repair what the checksums uniquely determine.
+  function hardCorrect(v) {
+    v = v.slice();
+    for (let it = 0; it < 6; it++) {
+      const st = status(v);
+      if (!st.badRows.length && !st.badCols.length && st.totalOk) break;
+      let moved = false;
+      if (st.badRows.length && !st.badCols.length) {
+        for (const y of st.badRows) {
+          let s = 0;
+          for (let x = 0; x < N; x++) s += v[y * 13 + x];
+          v[y * 13 + 12] = s % MOD; moved = true;
+        }
+      } else if (st.badCols.length && !st.badRows.length) {
+        for (const x of st.badCols) {
+          let s = 0;
+          for (let y = 0; y < N; y++) s += v[y * 13 + x];
+          v[156 + x] = s % MOD; moved = true;
+        }
+      } else {
+        outer:
+        for (const y of st.badRows) {
+          for (const x of st.badCols) {
+            let rs = 0;
+            for (let i = 0; i < N; i++) if (i !== x) rs += v[y * 13 + i];
+            const want = ((v[y * 13 + 12] - rs) % MOD + MOD) % MOD;
+            let cs = 0;
+            for (let j = 0; j < N; j++) if (j !== y) cs += v[j * 13 + x];
+            if ((cs + want) % MOD === v[156 + x] && want !== v[y * 13 + x]) {
+              v[y * 13 + x] = want; moved = true; break outer;
+            }
+          }
+        }
+      }
+      const st2 = status(v);
+      if (!st2.badRows.length && !st2.badCols.length && !st2.totalOk) {
+        let t = 0;
+        for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) t += v[y * 13 + x];
+        v[168] = t % MOD; moved = true;
+      }
+      if (!moved) break;
+    }
+    return v;
+  }
+
+  /** scores: array of Float32Array(17) per payload symbol; keys: symbol order. */
+  function correct(v, scores, keys, opts) {
+    opts = opts || {};
+    const topk = opts.topk || 4, beam = opts.beam || 6;
+    const steps = opts.steps || 6, maxPen = opts.maxPenalty || 0.55;
+    if (!scores || !scores.length) return { v: hardCorrect(v), ok: null };
+
+    // rank each position's alternatives by how much match score they give up.
+    // keys is the alphabet in value order, so an index here IS the cell value.
+    const ranked = scores.map((s) => {
+      const order = [];
+      for (let k = 0; k < s.length; k++) order.push(k);
+      order.sort((a, b) => s[b] - s[a]);
+      const best = s[order[0]];
+      return order.slice(0, topk).map((k) => ({ val: k, cost: best - s[k] }));
+    });
+
+    let states = [{ pen: 0, v: v.slice() }];
+    const seen = new Set();
+    for (let step = 0; step < steps; step++) {
+      for (const st of states) if (nViol(st.v) === 0) return { v: st.v, ok: true };
+      const nxt = [];
+      for (const stt of states) {
+        const st = status(stt.v);
+        for (const p of suspects(st)) {
+          const alts = ranked[p] || [];
+          for (const a of alts) {
+            if (a.val < 0 || a.val === stt.v[p]) continue;
+            const pen = stt.pen + a.cost;
+            if (pen > maxPen) continue;
+            const w = stt.v.slice();
+            w[p] = a.val;
+            const key = w.join(",");
+            if (seen.has(key)) continue;
+            seen.add(key);
+            nxt.push({ n: nViol(w), pen, v: w });
+          }
+        }
+      }
+      if (!nxt.length) break;
+      nxt.sort((a, b) => (a.n - b.n) || (a.pen - b.pen));
+      states = nxt.slice(0, beam).map((t) => ({ pen: t.pen, v: t.v }));
+      for (const s of states) if (nViol(s.v) === 0) return { v: s.v, ok: true };
+    }
+    const hv = hardCorrect(v);
+    return { v: hv, ok: nViol(hv) === 0 };
+  }
+
+  return { status, correct, hardCorrect, nViol };
+})();
+
+GLYPH.init(GLYPH_TPL_B64);
+
+// The rectified screen, kept in two forms. The canvas shown on screen stays
+// hard-thresholded because that's what reads clearly as "this is what the
+// scanner saw", but the glyph matcher gets the underlying GREYSCALE: the
+// threshold is what welds neighbouring strokes into one blob, and throwing
+// that detail away before matching costs real accuracy.
+let lastFlatGray = null;
+
+function flatten(snapCanvas) {
+  const sctx = snapCanvas.getContext("2d");
+  const img = sctx.getImageData(0, 0, snapCanvas.width, snapCanvas.height);
+  const blobs = findCornerBlobs(img);
+  const corners = classifyCorners(blobs);
+  if (!corners) { lastFlatGray = null; return null; }
+  const { tl, tr, bl, br } = corners;
+  const sx = FW / 320, sy = FH / 240;
+  const dst = [[10 * sx, 10 * sy], [310 * sx, 10 * sy], [10 * sx, 230 * sy], [310 * sx, 230 * sy]];
+  const h = homography(dst, [tl, tr, bl, br]);
+  const out = $("flat");
+  out.width = FW; out.height = FH;
+  const octx = out.getContext("2d");
+  const oimg = octx.createImageData(FW, FH);
+  const gray = new Float32Array(FW * FH);
+  const sw = snapCanvas.width, shh = snapCanvas.height, sd = img.data;
+  for (let y = 0; y < FH; y++)
+    for (let x = 0; x < FW; x++) {
+      const w = h[6] * x + h[7] * y + 1;
+      const u = (h[0] * x + h[1] * y + h[2]) / w;
+      const v = (h[3] * x + h[4] * y + h[5]) / w;
+      const o = (y * FW + x) * 4;
+      const ui = Math.round(u), vi = Math.round(v);
+      if (ui >= 0 && ui < sw && vi >= 0 && vi < shh) {
+        const i = (vi * sw + ui) * 4;
+        const lum = (sd[i] + sd[i + 1] + sd[i + 2]) / 3;
+        gray[y * FW + x] = lum;
+        const g = lum > 110 ? 255 : 0;
+        oimg.data[o] = oimg.data[o + 1] = oimg.data[o + 2] = g;
+      }
+      oimg.data[o + 3] = 255;
+    }
+  octx.putImageData(oimg, 0, 0);
+  out.style.display = "block";
+  lastFlatGray = gray;
+  return out;
+}
+
+// ---- camera + OCR ----
+//
+// Single button, three states, so the person never sees two separate
+// "start" and "scan" controls competing for attention:
+//   idle    -> "Start Camera" (default on page load / after nothing's
+//              been captured yet)
+//   live    -> a red "Capture" button, shown once the camera stream is
+//              actually playing
+//   review  -> "Retake", shown once a photo's been captured; the video
+//              feed is swapped out for the captured still frame so it's
+//              clear what was actually scanned
+// Capturing immediately runs flatten() + OCR + decode() with no separate
+// confirmation step — that's what "scanned immediately without user
+// intervention" means here, matching what snapBtn's old handler already
+// did on click; the only real change is that click now happens as part
+// of the single capture button rather than a second dedicated button.
+let stream = null;
+let camState = "idle";
+
+function stopCameraStream() {
+  if (stream) {
+    stream.getTracks().forEach((t) => t.stop());
+    stream = null;
+  }
+}
+
+function setCamState(next, opts) {
+  opts = opts || {};
+  camState = next;
+  const icon = $("camBtnIcon");
+  const label = $("camBtnLabel");
+  const btn = $("camBtn");
+  const v = $("video");
+  const snapCanvas = $("snap");
+  const flatCanvas = $("flat");
+  const ph = $("camPlaceholder");
+  const noRect = $("noRectifiedPlaceholder");
+
+  if (next === "idle") {
+    icon.textContent = "videocam";
+    icon.className = "material-symbols-outlined text-sm text-purple-400";
+    label.textContent = "Start Camera";
+    btn.className = "w-full flex items-center justify-center gap-2 py-2.5 px-3 rounded-xl bg-slate-800/90 hover:bg-slate-700/80 active:scale-[0.98] border border-white/10 text-slate-200 text-xs font-semibold transition-all shadow-sm";
+    // Initial launch: only the placeholder is visible, nothing else.
+    v.style.display = "none";
+    snapCanvas.style.display = "none";
+    flatCanvas.style.display = "none";
+    if (noRect) noRect.style.display = "none";
+    if (ph) ph.style.display = "flex";
+  } else if (next === "live") {
+    icon.textContent = "fiber_manual_record";
+    icon.className = "material-symbols-outlined text-sm text-white";
+    label.textContent = "Capture";
+    btn.className = "w-full flex items-center justify-center gap-2 py-2.5 px-3 rounded-xl bg-rose-600 hover:bg-rose-500 active:scale-[0.98] text-white text-xs font-semibold shadow-md shadow-rose-600/30 transition-all";
+    // Capture mode: only the live camera feed is visible. Any leftover
+    // captured/rectified image from a previous scan is cleared so a
+    // retake never briefly shows stale content.
+    v.style.display = "block";
+    snapCanvas.style.display = "none";
+    flatCanvas.style.display = "none";
+    if (noRect) noRect.style.display = "none";
+    if (ph) ph.style.display = "none";
+  } else if (next === "review") {
+    icon.textContent = "replay";
+    icon.className = "material-symbols-outlined text-sm text-slate-200";
+    label.textContent = "Retake";
+    btn.className = "w-full flex items-center justify-center gap-2 py-2.5 px-3 rounded-xl bg-slate-800/90 hover:bg-slate-700/80 active:scale-[0.98] border border-white/10 text-slate-200 text-xs font-semibold transition-all shadow-sm";
+    // After capture: show only the rectified/OCR'd image (flat canvas),
+    // never the raw captured photo (snap) -- the person should see what
+    // the scanner actually read, not just what the camera saw. When
+    // corner detection failed there's no rectified image to show; rather
+    // than fall back to the raw photo, show an explanatory placeholder
+    // instead (opts.rectified === false signals this case).
+    v.style.display = "none";
+    snapCanvas.style.display = "none";
+    if (opts.rectified === false) {
+      flatCanvas.style.display = "none";
+      if (noRect) noRect.style.display = "flex";
+    } else {
+      flatCanvas.style.display = "block";
+      if (noRect) noRect.style.display = "none";
+    }
+    if (ph) ph.style.display = "none";
+  }
+}
+
+async function startCamera() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+    const v = $("video");
+    v.srcObject = stream;
+    await v.play();
+    setCamState("live");
+  } catch (e) {
+    $("status").textContent = "Camera unavailable (needs HTTPS or localhost): " + e.message +
+      "\nUse the text box instead.";
+  }
+}
+
+// The live preview shows the camera stream through CSS `object-fit: cover`
+// at a fixed 16:9 box (see the video/canvas.snap rule above), which
+// center-crops the native stream to that ratio -- exactly like a photo app
+// viewfinder. That crop is NOT cosmetic: it's the only part of the frame
+// the person actually sees and aims the 4 corner squares within. Capturing
+// the full, uncropped v.videoWidth x v.videoHeight frame (the old
+// behavior) grabbed extra field-of-view the person never saw and had no
+// reason to keep clear -- stray bright objects out there (lights,
+// reflections, glare) could dominate corner-blob detection even when the
+// badge itself was framed perfectly in the visible preview. Replicating
+// object-fit: cover's own center-crop math here means what gets scanned
+// is exactly what was shown on screen.
+function coverCropRect(sourceW, sourceH, targetAspect) {
+  const sourceAspect = sourceW / sourceH;
+  if (sourceAspect > targetAspect) {
+    // Source is relatively wider than the target box -- crop left/right.
+    const cropW = sourceH * targetAspect;
+    return { sx: (sourceW - cropW) / 2, sy: 0, sw: cropW, sh: sourceH };
+  } else {
+    // Source is relatively taller than the target box -- crop top/bottom.
+    const cropH = sourceW / targetAspect;
+    return { sx: 0, sy: (sourceH - cropH) / 2, sw: sourceW, sh: cropH };
+  }
+}
+
+async function captureAndScan() {
+  const v = $("video"), c = $("snap");
+  const crop = coverCropRect(v.videoWidth, v.videoHeight, 16 / 9);
+  c.width = Math.round(crop.sw);
+  c.height = Math.round(crop.sh);
+  c.getContext("2d").drawImage(
+    v,
+    crop.sx, crop.sy, crop.sw, crop.sh,
+    0, 0, c.width, c.height
+  );
+
+  // Stop the live feed immediately (before OCR runs) so there's no dead
+  // time where the button says "Retake" but the video feed is still live
+  // and moving. flatten() runs synchronously right after, so camState can
+  // move straight to "review" already knowing whether a rectified image
+  // exists -- the raw photo (snap) is never shown, only the rectified
+  // result or, failing that, an explanatory placeholder (see setCamState).
+  stopCameraStream();
+
+  // Clear the raw code box so the incoming OCR result is what's visibly
+  // there, not a stale previous decode left over from an earlier scan.
+  $("code").value = "";
+
+  const flat = flatten(c);
+  setCamState("review", { rectified: !!flat });
+  $("status").textContent = flat
+    ? "Corners found. Reading text..."
+    : "Could not find all 4 corner squares, reading the raw photo instead...";
+  try {
+    if (flat && lastFlatGray) {
+      // Once the screen is rectified, its geometry is fully known from the
+      // firmware (8 lines, 21px pitch, one of 17 possible symbols per cell),
+      // so the glyph matcher reads it directly instead of asking Tesseract
+      // to recognise a bitmap font it was never trained on. Tesseract stays
+      // on as the fallback below for when the corners can't be found and
+      // there's no reliable geometry to match against.
+      const r = GLYPH.decodePayload(lastFlatGray);
+      $("code").value = groupCode(r.text);
+      // scores line up with r.text; the payload starts after the "GP1" tag
+      decode(r.text, { glyphScores: r.scores.slice(3) });
+      // Show what was actually decoded, including any checksum repair, so
+      // the box and the grid below it never disagree.
+      if (lastDecodedPayload.length === 169) {
+        $("code").value = groupCode("GP1" + lastDecodedPayload);
+      }
+    } else {
+      const text = await ocrWholeImage(c);
+      // Tesseract's raw output carries stray characters and its own line
+      // breaks; strip it to the alphabet decode() actually reads so the
+      // grouping shown matches the characters being decoded.
+      $("code").value = groupCode(text.toUpperCase().replace(/[^XAEFHKLMNPRTYJ479]/g, ""));
+      decode(text, { autoCorrect: true });
+    }
+  } catch (e) {
+    $("status").textContent = "Scan failed: " + e.message;
+  }
+}
+
+// Lay the code out the way the badge itself does: groups of four, six groups
+// to a line. The glyph decoder always returns exactly 172 symbols, so the
+// grouping lines up with the badge screen one-for-one (7 full lines plus a
+// final "FFX4"), which makes checking a scan against the screen a matter of
+// reading across. Callers pass an already-clean string; decode() strips
+// whitespace anyway, so this is purely for reading and stays hand-editable.
+function groupCode(s) {
+  const groups = [];
+  for (let i = 0; i < s.length; i += 4) groups.push(s.slice(i, i + 4));
+  const lines = [];
+  for (let i = 0; i < groups.length; i += 6) lines.push(groups.slice(i, i + 6).join(" "));
+  return lines.join("\n");
+}
+
+// ---- OCR: whole-image (fallback) vs line-by-line (preferred) ----
+
+async function ocrWholeImage(source) {
+  const worker = await Tesseract.createWorker("eng");
+  await worker.setParameters({
+    tessedit_char_whitelist: "XAEFHKLMNPRTYJ479 ",
+    tessedit_pageseg_mode: "6",
+  });
+  const { data } = await worker.recognize(source);
+  await worker.terminate();
+  return data.text;
+}
+
+// Per-line Tesseract OCR used to live here. It was replaced by the glyph
+// matcher above: with the screen rectified, the firmware pins every symbol's
+// position and the alphabet is only 17 characters, so matching each cell
+// against a reference image of itself beats asking a general-purpose OCR
+// engine to recognise a bitmap font it has never seen. Whole-image
+// Tesseract (ocrWholeImage) is still the fallback when the corner squares
+// can't be found and there is no geometry to match against.
+
+function retakePhoto() {
+  // startCamera() moves camState to "live" on success, which itself hides
+  // the captured/rectified canvases and any review placeholder (see
+  // setCamState) -- so retaking cleanly removes any taken image and shows
+  // only the live camera feed, with nothing left over from the last scan.
+  startCamera();
+}
+
+$("camBtn").onclick = () => {
+  if (camState === "idle") {
+    startCamera();
+  } else if (camState === "live") {
+    captureAndScan();
+  } else if (camState === "review") {
+    retakePhoto();
+  }
+};
+
+// ---- Solana Submit Interaction (real gas-station call) ----
+let currentTxSignature = "";
+
+$("solanaSubmitBtn").onclick = async () => {
+  if (!lastDecodeOk) {
+    $("status").textContent = "Fix the checksum errors above before submitting.";
+    return;
+  }
+  const btn = $("solanaSubmitBtn");
+  const label = $("submitBtnLabel");
+
+  btn.disabled = true;
+  label.innerHTML = "Broadcasting to Solana...";
+  $("status").textContent = "Sending payload to the gas station...\nBuilding compressed-tree append transaction...";
+
+  try {
+    const base = apiBase();
+    if (!base) throw new Error("Gas station URL is not configured.");
+    const res = await fetch(base.replace(/\/$/, "") + "/api/submit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code: lastDecodedPayload, pixels: pix }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || !body.ok) {
+      throw new Error(body.error || ("Gas station returned HTTP " + res.status));
+    }
+
+    currentTxSignature = body.signature;
+    const card = $("solanaTxCard");
+    const sigElem = $("txSig");
+    const slotElem = $("txSlot");
+
+    if (card && sigElem) {
+      sigElem.textContent = currentTxSignature.slice(0, 8) + "..." + currentTxSignature.slice(-8);
+      sigElem.title = currentTxSignature;
+      if (slotElem) slotElem.textContent = body.slot ? ("Slot #" + body.slot) : "Slot #—";
+      card.classList.remove("hidden");
+      card.classList.add("flex");
+    }
+
+    label.innerHTML = "Submitted to Solana!";
+    btn.classList.add("ring-2", "ring-teal-400");
+    $("status").textContent = "Transaction confirmed on Solana " + (body.cluster || "devnet") + "!\n" +
+      "Signature: " + currentTxSignature +
+      "\nLeaf hash: " + (body.leafHash ?? "—") +
+      "\nPayload: 12x12 badge matrix appended to the compression tree.";
+
+    // The feed doesn't know about this submission until the next poll
+    // (or tab switch) re-fetches /api/feed — invalidate the cached list
+    // so switching to Drawings shows it immediately rather than a stale
+    // page from before this submission landed.
+    feedNeedsRefresh = true;
+  } catch (e) {
+    $("status").textContent = "Submission failed: " + e.message;
+    label.innerHTML = "Publish New Image";
+    btn.disabled = false;
+    return;
+  }
+
+  setTimeout(() => {
+    label.innerHTML = "Publish New Image";
+    btn.disabled = !lastDecodeOk;
+    btn.classList.remove("ring-2", "ring-teal-400");
+  }, 2800);
+};
+
+function copyTxSignature() {
+  if (currentTxSignature) {
+    navigator.clipboard.writeText(currentTxSignature).then(() => {
+      const orig = $("status").textContent;
+      $("status").textContent = "Copied TX signature to clipboard: " + currentTxSignature;
+      setTimeout(() => { $("status").textContent = orig; }, 2500);
+    });
+  }
+}
+
+// UI demo seed
+function sampleDemoCode() {
+  const sample = "GP1" +
+    "XXXXXXXXXXXXX" +
+    "XXXXXAAAAXXXX" +
+    "XXXXAAAAAAXXX" +
+    "XXXAAAAEAAAAX" +
+    "XXXAAEEEEAAAX" +
+    "XXXXEEEEEEAAX" +
+    "XXXXXEEEEAAAX" +
+    "XXXXXXEAAAAAX" +
+    "XXXXXXAAAAAXX" +
+    "XXXXXAAAAAAXX" +
+    "XXXXXXAAAAXXX" +
+    "XXXXXXXXXXXXX" +
+    "XXXXXXXXXXXXX";
+  $("code").value = sample;
+  decode(sample);
+}
+
+// ---- Tab switching ----
+function switchToTab(tab) {
+  const feedSection = $("feedSection");
+  const uploadSection = $("uploadSection");
+  const tabFeedBtn = $("tabFeedBtn");
+  const tabUploadBtn = $("tabUploadBtn");
+
+  if (tab === "feed") {
+    feedSection.classList.remove("hidden");
+    feedSection.classList.add("flex");
+    uploadSection.classList.add("hidden");
+    uploadSection.classList.remove("flex");
+    tabFeedBtn.classList.add("active");
+    tabUploadBtn.classList.remove("active");
+    if (feedNeedsRefresh || !feedLoadedOnce) loadFeed({ reset: true });
+  } else {
+    uploadSection.classList.remove("hidden");
+    uploadSection.classList.add("flex");
+    feedSection.classList.add("hidden");
+    feedSection.classList.remove("flex");
+    tabUploadBtn.classList.add("active");
+    tabFeedBtn.classList.remove("active");
+  }
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+// ---- Doomscroll feed (real data from GET /api/feed) ----
+let feedLoadedOnce = false;
+let feedNeedsRefresh = false;
+let feedNextBefore = null;
+let feedPollTimer = null;
+// Every signature currently rendered in the DOM, so a periodic refresh
+// can tell "brand new" apart from "already showing" and only prepend
+// what's actually new — see pollForNewImages() below.
+let feedSeenSignatures = new Set();
+
+function timeAgo(isoString) {
+  if (!isoString) return "";
+  const seconds = Math.max(0, Math.floor((Date.now() - new Date(isoString).getTime()) / 1000));
+  if (seconds < 60) return seconds + "s ago";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return minutes + "m ago";
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return hours + "h ago";
+  return Math.floor(hours / 24) + "d ago";
+}
+
+function shortSig(sig) {
+  return sig.slice(0, 6) + "..." + sig.slice(-6);
+}
+
+function buildFeedCard(image) {
+  const article = document.createElement("article");
+  article.className = "bg-obsidian-900/90 border border-white/10 rounded-2xl p-4 shadow-xl relative overflow-hidden";
+
+  const header = document.createElement("div");
+  header.className = "flex items-center justify-between mb-3 font-mono text-xs";
+  header.innerHTML =
+    '<div class="flex items-center gap-1.5 text-slate-400">' +
+      '<span class="text-slate-200 font-medium">TX: ' + shortSig(image.signature) + '</span>' +
+      '<span class="text-slate-600">•</span>' +
+      '<span class="text-slate-500 text-[11px]">' + timeAgo(image.timestamp) + '</span>' +
+    '</div>' +
+    '<span class="text-[10px] px-2 py-0.5 rounded bg-slate-800/80 text-slate-300 border border-slate-700/50">12×12 BADGE</span>';
+
+  const gridWrap = document.createElement("div");
+  gridWrap.className = "bg-obsidian-950/80 rounded-xl p-3 border border-white/5 mb-3 flex flex-col items-center";
+
+  const grid = document.createElement("div");
+  grid.className = "w-full max-w-[260px] feed-grid";
+  image.pixels.forEach((val) => {
+    const cell = document.createElement("div");
+    cell.className = "feed-cell";
+    cell.style.backgroundColor = hex(COLORS[val] ?? 0xffffff);
+    grid.appendChild(cell);
+  });
+  gridWrap.appendChild(grid);
+
+  const footer = document.createElement("div");
+  footer.className = "w-full flex items-center justify-between mt-2.5 pt-2 border-t border-white/5 text-[10px] font-mono text-slate-500";
+  footer.innerHTML =
+    '<span>SLOT #' + image.slot + '</span>' +
+    '<span class="text-emerald-400">144 PIXELS STORED</span>';
+  gridWrap.appendChild(footer);
+
+  const actions = document.createElement("div");
+  actions.className = "flex items-center justify-between text-slate-400 pt-0.5";
+  actions.innerHTML =
+    '<span class="text-[10px] font-mono text-slate-600">On-chain • Solana</span>' +
+    '<button class="text-[11px] font-mono text-slate-500 hover:text-slate-300 flex items-center gap-1">' +
+      '<span class="material-symbols-outlined text-[14px]">content_copy</span>' +
+      '<span>Copy TX</span>' +
+    '</button>';
+  actions.querySelector("button").onclick = () => {
+    navigator.clipboard.writeText(image.signature).catch(() => {});
+  };
+
+  article.appendChild(header);
+  article.appendChild(gridWrap);
+  article.appendChild(actions);
+  return article;
+}
+
+async function loadFeed(opts) {
+  opts = opts || {};
+  const reset = !!opts.reset;
+  const base = apiBase();
+  const statusEl = $("feedStatus");
+  const listEl = $("feedList");
+  const loadMoreBtn = $("feedLoadMoreBtn");
+
+  if (!base) {
+    statusEl.innerHTML = '<span class="text-amber-400">Gas station URL is not configured — cannot load the feed.</span>';
+    return;
+  }
+
+  if (reset) {
+    feedNextBefore = null;
+    feedSeenSignatures = new Set();
+    listEl.innerHTML = "";
+    statusEl.classList.remove("hidden");
+    statusEl.innerHTML =
+      '<div class="w-5 h-5 border-2 border-emerald-400 border-t-transparent rounded-full animate-spin mb-2"></div>' +
+      '<span>Syncing on-chain badge blocks...</span>';
+    loadMoreBtn.classList.add("hidden");
+  }
+
+  try {
+    const url = new URL(base.replace(/\/$/, "") + "/api/feed");
+    url.searchParams.set("limit", "20");
+    if (feedNextBefore) url.searchParams.set("before", feedNextBefore);
+
+    const res = await fetch(url.toString());
+    const body = await res.json();
+    if (!res.ok || !body.ok) throw new Error(body.error || ("Feed returned HTTP " + res.status));
+
+    feedLoadedOnce = true;
+    feedNeedsRefresh = false;
+    feedNextBefore = body.nextBefore || null;
+
+    if (reset && body.images.length === 0) {
+      statusEl.innerHTML = '<span>No drawings published yet. Be the first — scan a badge in Upload / Scan.</span>';
+    } else {
+      statusEl.classList.add("hidden");
+    }
+
+    body.images.forEach((image) => {
+      feedSeenSignatures.add(image.signature);
+      listEl.appendChild(buildFeedCard(image));
+    });
+    loadMoreBtn.classList.toggle("hidden", !feedNextBefore);
+  } catch (e) {
+    statusEl.classList.remove("hidden");
+    statusEl.innerHTML = '<span class="text-rose-400">Could not load the feed: ' + e.message + '</span>';
+  }
+}
+
+$("feedLoadMoreBtn").onclick = () => loadFeed({ reset: false });
+
+// Periodic refresh so newly published drawings show up without a manual
+// pull-to-refresh. Deliberately NOT a reset+reload: that would wipe out
+// any "Load more" pages already fetched and reset scroll position every
+// time it fired, which is exactly the janky behavior a doomscroll feed
+// must not have. Instead this fetches just the newest page, compares
+// against what's already rendered (feedSeenSignatures), and prepends
+// only the genuinely new cards — everything already on screen, and any
+// older pages loaded via "Load more", are left untouched.
+async function pollForNewImages() {
+  if ($("feedSection").classList.contains("hidden")) return; // only poll the visible tab
+  const base = apiBase();
+  if (!base) return;
+
+  try {
+    const url = new URL(base.replace(/\/$/, "") + "/api/feed");
+    url.searchParams.set("limit", "20");
+    const res = await fetch(url.toString());
+    const body = await res.json();
+    if (!res.ok || !body.ok) return; // silent on poll failures; the next tick retries
+
+    const freshImages = body.images.filter((image) => !feedSeenSignatures.has(image.signature));
+    if (!freshImages.length) return;
+
+    const listEl = $("feedList");
+    const statusEl = $("feedStatus");
+    statusEl.classList.add("hidden"); // covers the empty-feed message once the first image arrives
+
+    // body.images arrives newest-first; insert in that same order at the
+    // very top so the newest submission ends up first in the list.
+    freshImages.forEach((image) => feedSeenSignatures.add(image.signature));
+    for (let i = freshImages.length - 1; i >= 0; i--) {
+      listEl.insertBefore(buildFeedCard(freshImages[i]), listEl.firstChild);
+    }
+  } catch {
+    // Network hiccup on a background poll — not worth surfacing to the
+    // user; loadFeed()'s own error handling covers the explicit-load path.
+  }
+}
+
+function startFeedPolling() {
+  if (feedPollTimer) clearInterval(feedPollTimer);
+  feedPollTimer = setInterval(pollForNewImages, 20000);
+}
+
+// Initial render of default empty matrix + first feed load
+render();
+switchToTab("feed");
+startFeedPolling();
+</script>
+
+
+</body></html>

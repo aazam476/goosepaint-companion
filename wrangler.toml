@@ -1,0 +1,20 @@
+# wrangler.toml
+name = 'goosepaint-companion'
+compatibility_date = "2024-11-01"
+pages_build_output_dir = "dist"
+
+# @solana/web3.js relies heavily on Node's Buffer global, which
+# workerd (Cloudflare's runtime) doesn't provide unless this flag is
+# set. Without it, every gas-station request fails at import time with
+# "Buffer is not defined" — this is the standard fix used across the
+# Solana + Cloudflare Workers ecosystem, not a project-specific hack.
+compatibility_flags = ["nodejs_compat"]
+
+# Bind a KV namespace for per-IP rate limiting. Create it once with:
+#   npx wrangler kv namespace create RATE_LIMIT_KV
+# then paste the returned id below (and again with --preview for local
+# `wrangler pages dev`).
+[[kv_namespaces]]
+binding = "RATE_LIMIT_KV"
+id = "c9b2c3bb8ee8405ca6da3da4ba32533c"
+preview_id = "b37beb88044e4038963507d38bfee496"
